@@ -1,6 +1,8 @@
 import type { Tool } from "../types/models";
 
 interface Props {
+  editorMode: "pixels" | "bones";
+  onEditorModeChange: (mode: "pixels" | "bones") => void;
   activeTool: Tool;
   onToolChange: (tool: Tool) => void;
   brushSize: number;
@@ -29,6 +31,8 @@ const toolOptions: Array<{ id: Tool; label: string; key: string; group: "Draw" |
 ];
 
 export function ToolPanel({
+  editorMode,
+  onEditorModeChange,
   activeTool,
   onToolChange,
   brushSize,
@@ -49,9 +53,22 @@ export function ToolPanel({
   return (
     <section className="panel">
       <h3>Tools</h3>
+      <div className="inline-buttons">
+        <button className={editorMode === "pixels" ? "active" : ""} onClick={() => onEditorModeChange("pixels")}>
+          Pixels
+        </button>
+        <button className={editorMode === "bones" ? "active" : ""} onClick={() => onEditorModeChange("bones")}>
+          Bones
+        </button>
+      </div>
       <label>
         Tool
-        <select className="tool-select" value={activeTool} onChange={(e) => onToolChange(e.target.value as Tool)}>
+        <select
+          className="tool-select"
+          value={activeTool}
+          onChange={(e) => onToolChange(e.target.value as Tool)}
+          disabled={editorMode === "bones"}
+        >
           <optgroup label="Draw">
             {grouped.Draw.map((tool) => (
               <option key={tool.id} value={tool.id}>
@@ -83,6 +100,7 @@ export function ToolPanel({
           max={16}
           value={brushSize}
           onChange={(e) => onBrushSizeChange(Number(e.target.value))}
+          disabled={editorMode === "bones"}
         />
       </label>
       <label>

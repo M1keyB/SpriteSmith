@@ -23,7 +23,19 @@ export function ExportPanel({ state, dispatch }: Props): JSX.Element {
   const activeFrame = state.project.frames[state.activeFrameIndex];
 
   const exportImage = (format: "png" | "jpeg"): void => {
-    const url = exportFrameImage(activeFrame, state.project.gridWidth, state.project.gridHeight, state.project.exportScale, format);
+    const url = exportFrameImage(
+      activeFrame,
+      state.project.gridWidth,
+      state.project.gridHeight,
+      state.project.exportScale,
+      format,
+      {
+        rig: state.project.rig,
+        rigPoseByFrame: state.project.rigPoseByFrame,
+        includeOverlay: state.project.rig.includeOverlayInExport
+      },
+      state.activeFrameIndex
+    );
     const a = document.createElement("a");
     a.href = url;
     a.download = `${state.project.name || "spritesmith"}.${format === "png" ? "png" : "jpg"}`;
@@ -31,7 +43,19 @@ export function ExportPanel({ state, dispatch }: Props): JSX.Element {
   };
 
   const exportAnimatedGif = async (): Promise<void> => {
-    const blob = await exportGif(state.project.frames, state.project.gridWidth, state.project.gridHeight, state.project.exportScale, state.globalFpsOverrideEnabled, state.globalFps);
+    const blob = await exportGif(
+      state.project.frames,
+      state.project.gridWidth,
+      state.project.gridHeight,
+      state.project.exportScale,
+      state.globalFpsOverrideEnabled,
+      state.globalFps,
+      {
+        rig: state.project.rig,
+        rigPoseByFrame: state.project.rigPoseByFrame,
+        includeOverlay: state.project.rig.includeOverlayInExport
+      }
+    );
     downloadBlob(blob, `${state.project.name || "spritesmith"}.gif`);
   };
 

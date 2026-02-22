@@ -72,21 +72,6 @@ export function PreviewPanel({ state, dispatch }: Props): JSX.Element {
     <section className="panel">
       <h3>Preview</h3>
       <canvas ref={ref} className="preview-canvas" />
-      <div className="inline-buttons">
-        <button
-          onClick={() => {
-            if (!state.isPlaying && !state.loopPreview && state.activeFrameIndex >= state.project.frames.length - 1) {
-              dispatch({ type: "SET_ACTIVE_FRAME", frameIndex: 0 });
-            }
-            dispatch({ type: "SET_PLAYING", value: !state.isPlaying });
-          }}
-        >
-          {state.isPlaying ? "Stop" : "Play"}
-        </button>
-        <label><input type="checkbox" checked={state.loopPreview} onChange={(e) => dispatch({ type: "SET_LOOP", value: e.target.checked })} />Loop</label>
-      </div>
-      <label><input type="checkbox" checked={state.globalFpsOverrideEnabled} onChange={(e) => dispatch({ type: "SET_GLOBAL_FPS_OVERRIDE", value: e.target.checked })} />Global FPS</label>
-      <input type="number" min={1} max={60} value={state.globalFps} onChange={(e) => dispatch({ type: "SET_GLOBAL_FPS", value: Number(e.target.value) })} />
     </section>
   );
 }

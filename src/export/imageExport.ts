@@ -1,15 +1,18 @@
 import GIF from "gif.js";
 import workerUrl from "gif.js/dist/gif.worker.js?url";
-import type { Frame } from "../types/models";
+import { drawRigOverlay } from "../editor/rig";
+import type { BonePose, Frame, RigData } from "../types/models";
 import { packedToRgba } from "../editor/color";
 import { getCompositePixels } from "../editor/layers";
 
 function frameToCanvas(
   frame: Frame,
+  frameIndex: number,
   width: number,
   height: number,
   scale: number,
-  transparentKey?: number
+  transparentKey?: number,
+  rigOptions?: { rig: RigData; rigPoseByFrame: Record<string, Record<string, BonePose>>; includeOverlay: boolean }
 ): HTMLCanvasElement {
   const canvas = document.createElement("canvas");
   canvas.width = width * scale;
@@ -35,6 +38,9 @@ function frameToCanvas(
       ctx.fillRect(x * scale, y * scale, scale, scale);
     }
   }
+  if (rigOptions?.includeOverlay) {
+    drawRigOverlay(ctx, rigOptions.rig, frameIndex, rigOptions.rigPoseByFrame, scale, 0, 0, null, null);
+  }
   return canvas;
 }
 
@@ -43,9 +49,11 @@ export function exportFrameImage(
   width: number,
   height: number,
   scale: number,
-  format: "png" | "jpeg"
+  format: "png" | "jpeg",
+  rigOptions?: { rig: RigData; rigPoseByFrame: Record<string, Record<string, BonePose>>; includeOverlay: boolean },
+  frameIndex = 0
 ): string {
-  const canvas = frameToCanvas(frame, width, height, scale);
+  const canvas = frameToCanvas(frame, frameIndex, width, height, scale, undefined, rigOptions);
   return canvas.toDataURL(format === "png" ? "image/png" : "image/jpeg", 0.95);
 }
 
@@ -77,7 +85,8 @@ export async function exportGif(
   height: number,
   scale: number,
   fpsOverrideEnabled: boolean,
-  fps: number
+  fps: number,
+  rigOptions?: { rig: RigData; rigPoseByFrame: Record<string, Record<string, BonePose>>; includeOverlay: boolean }
 ): Promise<Blob> {
   const transparentKey = pickTransparentKey(frames, width, height);
   const gif = new GIF({
@@ -89,8 +98,9 @@ export async function exportGif(
     transparent: transparentKey
   });
 
-  for (const frame of frames) {
-    const canvas = frameToCanvas(frame, width, height, scale, transparentKey);
+  for (let frameIndex = 0; frameIndex < frames.length; frameIndex += 1) {
+    const frame = frames[frameIndex];
+    const canvas = frameToCanvas(frame, frameIndex, width, height, scale, transparentKey, rigOptions);
     const delay = fpsOverrideEnabled ? Math.round(1000 / fps) : frame.durationMs;
     gif.addFrame(canvas, { delay, copy: true });
   }

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { packedToRgba } from "../editor/color";
 import { getCompositePixels, getEditablePixels } from "../editor/layers";
 import { drawCheckerboard, drawGrid, drawPixels } from "../editor/render";
+import { buildPosedRig, drawRigOverlay } from "../editor/rig";
 import { circlePoints, linePoints, rectPoints } from "../editor/tools";
 import type { EditorState, Point } from "../types/models";
 import type { EditorAction } from "../state/editorReducer";
@@ -9,6 +10,7 @@ import type { EditorAction } from "../state/editorReducer";
 interface Props {
   state: EditorState;
   dispatch: React.Dispatch<EditorAction>;
+  canvasGroup: JSX.Element;
 }
 
 interface SelectionBox {
@@ -27,10 +29,30 @@ interface FloatingSelection extends LassoSelection {
   pixels: number[];
   anchorX: number;
   anchorY: number;
+  sourceX: number;
+  sourceY: number;
 }
 
 interface ClipboardSelection extends LassoSelection {
   pixels: number[];
+}
+
+interface RigDragState {
+  jointId: string;
+  moved: boolean;
+}
+
+function normalizeRectSelection(start: Point, end: Point): { x: number; y: number; w: number; h: number } {
+  const xMin = Math.min(start.x, end.x);
+  const yMin = Math.min(start.y, end.y);
+  const xMax = Math.max(start.x, end.x);
+  const yMax = Math.max(start.y, end.y);
+  return {
+    x: xMin,
+    y: yMin,
+    w: xMax - xMin + 1,
+    h: yMax - yMin + 1
+  };
 }
 
 function pointInPolygon(px: number, py: number, polygon: Point[]): boolean {
@@ -128,28 +150,65 @@ function extractSelection(
   return { remaining, selected, selectedMask };
 }
 
-function stampSelection(
-  pixels: number[],
-  gridWidth: number,
-  gridHeight: number,
-  selection: LassoSelection,
-  selectedPixels: number[],
-  mode: "overwrite" | "preserve-destination" = "overwrite"
-): number[] {
-  const next = pixels.slice();
-  for (let y = 0; y < selection.height; y += 1) {
-    const targetY = selection.y + y;
-    if (targetY < 0 || targetY >= gridHeight) continue;
-    for (let x = 0; x < selection.width; x += 1) {
-      if (!(selection.mask[y * selection.width + x] ?? false)) continue;
-      const targetX = selection.x + x;
-      if (targetX < 0 || targetX >= gridWidth) continue;
-      const srcIndex = y * selection.width + x;
-      const packed = selectedPixels[srcIndex] ?? 0;
+type CommitOp = "move" | "paste" | "duplicate";
+
+function commitSelectionToLayerPixels(params: {
+  basePixels: number[];
+  gridWidth: number;
+  gridHeight: number;
+  srcX: number;
+  srcY: number;
+  width: number;
+  height: number;
+  dstX: number;
+  dstY: number;
+  selectedPixels: number[];
+  mask: boolean[];
+  op: CommitOp;
+}): number[] {
+  const {
+    basePixels,
+    gridWidth,
+    gridHeight,
+    srcX,
+    srcY,
+    width,
+    height,
+    dstX,
+    dstY,
+    selectedPixels,
+    mask,
+    op
+  } = params;
+  const next = basePixels.slice();
+
+  // For move/cut semantics, clear source once using the selection mask.
+  if (op === "move") {
+    for (let sy = 0; sy < height; sy += 1) {
+      const py = srcY + sy;
+      if (py < 0 || py >= gridHeight) continue;
+      for (let sx = 0; sx < width; sx += 1) {
+        if (!(mask[sy * width + sx] ?? false)) continue;
+        const packed = selectedPixels[sy * width + sx] ?? 0;
+        if ((packed & 255) === 0) continue;
+        const px = srcX + sx;
+        if (px < 0 || px >= gridWidth) continue;
+        next[py * gridWidth + px] = 0;
+      }
+    }
+  }
+
+  // Composite onto destination: transparent pixels never clear destination.
+  for (let sy = 0; sy < height; sy += 1) {
+    const py = dstY + sy;
+    if (py < 0 || py >= gridHeight) continue;
+    for (let sx = 0; sx < width; sx += 1) {
+      if (!(mask[sy * width + sx] ?? false)) continue;
+      const packed = selectedPixels[sy * width + sx] ?? 0;
       if ((packed & 255) === 0) continue;
-      const dstIndex = targetY * gridWidth + targetX;
-      if (mode === "preserve-destination" && (next[dstIndex] & 255) !== 0) continue;
-      next[dstIndex] = packed;
+      const px = dstX + sx;
+      if (px < 0 || px >= gridWidth) continue;
+      next[py * gridWidth + px] = packed;
     }
   }
   return next;
@@ -344,9 +403,10 @@ function rotationStepDegreesForSelection(selection: LassoSelection): number {
   return Math.max(1, Math.min(30, degrees));
 }
 
-export function CanvasStage({ state, dispatch }: Props): JSX.Element {
+export function CanvasStage({ state, dispatch, canvasGroup }: Props): JSX.Element {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wrapRef = useRef<HTMLDivElement | null>(null);
+  const activePointerIdRef = useRef<number | null>(null);
   const [dragStart, setDragStart] = useState<Point | null>(null);
   const [dragCurrent, setDragCurrent] = useState<Point | null>(null);
   const [lastPoint, setLastPoint] = useState<Point | null>(null);
@@ -356,6 +416,10 @@ export function CanvasStage({ state, dispatch }: Props): JSX.Element {
   const [floatingSelection, setFloatingSelection] = useState<FloatingSelection | null>(null);
   const [lassoPath, setLassoPath] = useState<Point[] | null>(null);
   const [clipboardSelection, setClipboardSelection] = useState<ClipboardSelection | null>(null);
+  const [rigDrag, setRigDrag] = useState<RigDragState | null>(null);
+  const [segmentSelectStart, setSegmentSelectStart] = useState<Point | null>(null);
+  const [segmentSelectCurrent, setSegmentSelectCurrent] = useState<Point | null>(null);
+  const [segmentImageMap, setSegmentImageMap] = useState<Record<string, HTMLImageElement>>({});
   const [grabStart, setGrabStart] = useState<Point | null>(null);
   const [grabBasePixels, setGrabBasePixels] = useState<number[] | null>(null);
   const [grabHasPushedHistory, setGrabHasPushedHistory] = useState(false);
@@ -398,7 +462,47 @@ export function CanvasStage({ state, dispatch }: Props): JSX.Element {
     };
   }, [state.referenceImage]);
 
-  const getPixelPoint = (event: React.MouseEvent<HTMLCanvasElement>): Point | null => {
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    canvas.style.touchAction = "none";
+  }, []);
+
+  useEffect(() => {
+    if (state.editorMode !== "bones") setRigDrag(null);
+  }, [state.editorMode]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const relevant = state.project.segments.filter((segment) => segment.frameIndex === state.activeFrameIndex);
+    if (relevant.length === 0) {
+      setSegmentImageMap({});
+      return;
+    }
+    const entries: Array<Promise<[string, HTMLImageElement]>> = relevant.map(
+      (segment) =>
+        new Promise((resolve, reject) => {
+          const image = new Image();
+          image.onload = () => resolve([segment.id, image]);
+          image.onerror = () => reject(new Error(`Failed to load segment ${segment.id}`));
+          image.src = segment.pixels;
+        })
+    );
+    Promise.allSettled(entries).then((results) => {
+      if (cancelled) return;
+      const loaded: Record<string, HTMLImageElement> = {};
+      for (const result of results) {
+        if (result.status !== "fulfilled") continue;
+        loaded[result.value[0]] = result.value[1];
+      }
+      setSegmentImageMap(loaded);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [state.activeFrameIndex, state.project.segments]);
+
+  const getPixelPoint = (event: React.PointerEvent<HTMLCanvasElement>): Point | null => {
     const canvas = canvasRef.current;
     if (!canvas) return null;
     const rect = canvas.getBoundingClientRect();
@@ -408,6 +512,49 @@ export function CanvasStage({ state, dispatch }: Props): JSX.Element {
     const py = Math.floor(y / state.zoom);
     if (px < 0 || py < 0 || px >= state.project.gridWidth || py >= state.project.gridHeight) return null;
     return { x: px, y: py };
+  };
+
+  const pressureAdjustedBrushSize = (event: React.PointerEvent<HTMLCanvasElement>): number => {
+    const pressure = event.pointerType === "pen" ? event.pressure || 1 : 1;
+    const scaled = state.brushSize * (0.5 + pressure * 0.5);
+    return Math.max(1, Math.round(scaled));
+  };
+
+  const rigJointAtPoint = (point: Point): string | null => {
+    if (!frame) return null;
+    const posed = buildPosedRig(state.activeFrameIndex, state.project.rig, state.project.rigPoseByFrame);
+    for (const joint of state.project.rig.joints) {
+      const posedJoint = posed.jointMap[joint.id];
+      if (!posedJoint) continue;
+      if (Math.hypot(point.x - posedJoint.x, point.y - posedJoint.y) <= 1) return joint.id;
+    }
+    return null;
+  };
+
+  const rigBoneAtPoint = (point: Point): string | null => {
+    if (!frame) return null;
+    const posed = buildPosedRig(state.activeFrameIndex, state.project.rig, state.project.rigPoseByFrame);
+    let bestId: string | null = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    for (const bone of state.project.rig.bones) {
+      const a = posed.jointMap[bone.aJointId];
+      const b = posed.jointMap[bone.bJointId];
+      if (!a || !b) continue;
+      const abx = b.x - a.x;
+      const aby = b.y - a.y;
+      const apx = point.x - a.x;
+      const apy = point.y - a.y;
+      const ab2 = abx * abx + aby * aby;
+      const t = ab2 <= 0.0001 ? 0 : Math.max(0, Math.min(1, (apx * abx + apy * aby) / ab2));
+      const cx = a.x + abx * t;
+      const cy = a.y + aby * t;
+      const distance = Math.hypot(point.x - cx, point.y - cy);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestId = bone.id;
+      }
+    }
+    return bestDistance <= 0.75 ? bestId : null;
   };
 
   const previewPoints = useMemo(() => {
@@ -450,6 +597,46 @@ export function CanvasStage({ state, dispatch }: Props): JSX.Element {
     if (state.onionSkin.showPrev && prevPixels) drawPixels(ctx, prevPixels, state.project.gridWidth, state.project.gridHeight, state.zoom, state.panX, state.panY, state.onionSkin.opacityPrev);
     if (state.onionSkin.showNext && nextPixels) drawPixels(ctx, nextPixels, state.project.gridWidth, state.project.gridHeight, state.zoom, state.panX, state.panY, state.onionSkin.opacityNext);
     drawPixels(ctx, framePixels, state.project.gridWidth, state.project.gridHeight, state.zoom, state.panX, state.panY, 1);
+
+    const segmentsForFrame = state.project.segments
+      .filter((segment) => segment.frameIndex === state.activeFrameIndex)
+      .slice()
+      .sort((a, b) => a.zIndex - b.zIndex);
+    if (segmentsForFrame.length > 0) {
+      const posedRig = buildPosedRig(state.activeFrameIndex, state.project.rig, state.project.rigPoseByFrame);
+      for (const segment of segmentsForFrame) {
+        const image = segmentImageMap[segment.id];
+        if (!image) continue;
+        const bone = state.project.rig.bones.find((candidate) => candidate.id === segment.boneId);
+        if (!bone) continue;
+        const startJoint = posedRig.boneStartMap[bone.id] ?? posedRig.jointMap[bone.aJointId];
+        if (!startJoint) continue;
+        const angle = posedRig.boneAngleRadMap[bone.id] ?? 0;
+        ctx.save();
+        ctx.imageSmoothingEnabled = false;
+        ctx.translate(state.panX + startJoint.x * state.zoom + state.zoom / 2, state.panY + startJoint.y * state.zoom + state.zoom / 2);
+        ctx.rotate(angle);
+        ctx.translate(segment.offset.x * state.zoom, segment.offset.y * state.zoom);
+        ctx.drawImage(
+          image,
+          -segment.anchor.x * state.zoom,
+          -segment.anchor.y * state.zoom,
+          segment.w * state.zoom,
+          segment.h * state.zoom
+        );
+        if (segment.id === state.selectedSegmentId) {
+          ctx.strokeStyle = "#ff9a5c";
+          ctx.lineWidth = 1.5;
+          ctx.strokeRect(
+            -segment.anchor.x * state.zoom,
+            -segment.anchor.y * state.zoom,
+            segment.w * state.zoom,
+            segment.h * state.zoom
+          );
+        }
+        ctx.restore();
+      }
+    }
 
     if (previewPoints.length > 0) {
       ctx.fillStyle = "rgba(255,255,255,0.7)";
@@ -516,8 +703,36 @@ export function CanvasStage({ state, dispatch }: Props): JSX.Element {
       ctx.restore();
     }
 
+    if (state.segmentSelection && state.segmentSelection.w > 0 && state.segmentSelection.h > 0) {
+      ctx.save();
+      ctx.setLineDash([6, 4]);
+      ctx.strokeStyle = "#ffcf7a";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(
+        state.panX + state.segmentSelection.x * state.zoom,
+        state.panY + state.segmentSelection.y * state.zoom,
+        state.segmentSelection.w * state.zoom,
+        state.segmentSelection.h * state.zoom
+      );
+      ctx.restore();
+    }
+
+    if (state.project.rig.showOverlay) {
+      drawRigOverlay(
+        ctx,
+        state.project.rig,
+        state.activeFrameIndex,
+        state.project.rigPoseByFrame,
+        state.zoom,
+        state.panX,
+        state.panY,
+        state.selectedRigJointId,
+        state.selectedRigBoneId
+      );
+    }
+
     if (state.showGrid) drawGrid(ctx, state.project.gridWidth, state.project.gridHeight, state.zoom, state.panX, state.panY);
-  }, [dragCurrent, floatingSelection, framePixels, isLassoTool, lassoPath, nextPixels, prevPixels, previewPoints, referenceBitmap, selectionBox, state]);
+  }, [dragCurrent, floatingSelection, framePixels, isLassoTool, lassoPath, nextPixels, prevPixels, previewPoints, referenceBitmap, selectionBox, segmentImageMap, state]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -546,14 +761,50 @@ export function CanvasStage({ state, dispatch }: Props): JSX.Element {
     return () => canvas.removeEventListener("wheel", handleWheel);
   }, [dispatch, state.panX, state.panY, state.zoom]);
 
-  const onMouseDown = (event: React.MouseEvent<HTMLCanvasElement>): void => {
+  const onPointerDown = (event: React.PointerEvent<HTMLCanvasElement>): void => {
     event.preventDefault();
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    if (activePointerIdRef.current !== null && activePointerIdRef.current !== event.pointerId) return;
+    activePointerIdRef.current = event.pointerId;
+    canvas.setPointerCapture(event.pointerId);
+    canvas.style.touchAction = "none";
+    console.log(event.pointerType, event.pressure);
     if (event.button === 2) {
       setPanning(true);
       return;
     }
     const point = getPixelPoint(event);
     if (!point) return;
+
+    if (state.editorMode === "bones") {
+      if (state.segmentSelectionMode) {
+        setSegmentSelectStart(point);
+        setSegmentSelectCurrent(point);
+        dispatch({ type: "SELECT_SEGMENT", segmentId: null });
+        dispatch({ type: "SET_SEGMENT_SELECTION", selection: { x: point.x, y: point.y, w: 1, h: 1 } });
+        return;
+      }
+
+      const hitJointId = rigJointAtPoint(point);
+      if (hitJointId) {
+        dispatch({ type: "RIG_SELECT_JOINT", jointId: hitJointId });
+        setRigDrag({ jointId: hitJointId, moved: false });
+        return;
+      }
+      const hitBoneId = rigBoneAtPoint(point);
+      if (hitBoneId) {
+        dispatch({ type: "RIG_SELECT_BONE", boneId: hitBoneId });
+        return;
+      }
+      dispatch({
+        type: "RIG_ADD_CHAIN_JOINT",
+        x: point.x,
+        y: point.y,
+        parentJointId: state.rigChainJointId ?? state.selectedRigJointId
+      });
+      return;
+    }
 
     if (state.activeTool === "rotate") {
       if (selectionBox && isInsideSelection(point, selectionBox)) {
@@ -575,24 +826,15 @@ export function CanvasStage({ state, dispatch }: Props): JSX.Element {
     if (isLassoTool) {
       if (state.activeTool === "select" && selectionBox && isInsideSelection(point, selectionBox)) {
         const editablePixels = getEditablePixels(frame);
-        const { remaining, selected, selectedMask } = extractSelection(
-          editablePixels,
-          state.project.gridWidth,
-          state.project.gridHeight,
-          selectionBox
-        );
-        dispatch({
-          type: "UPDATE_FRAME_PIXELS",
-          frameIndex: state.activeFrameIndex,
-          pixels: remaining,
-          pushHistory: true
-        });
+        const selected = captureSelectionPixels(editablePixels, state.project.gridWidth, state.project.gridHeight, selectionBox);
         setFloatingSelection({
           ...selectionBox,
-          mask: selectedMask,
+          mask: selectionBox.mask.slice(),
           pixels: selected,
           anchorX: point.x - selectionBox.x,
-          anchorY: point.y - selectionBox.y
+          anchorY: point.y - selectionBox.y,
+          sourceX: selectionBox.x,
+          sourceY: selectionBox.y
         });
         setDragStart(point);
         setDragCurrent(point);
@@ -627,11 +869,12 @@ export function CanvasStage({ state, dispatch }: Props): JSX.Element {
     setLastPoint(point);
 
     if (["fill", "picker", "pencil", "eraser", "auto-remove"].includes(state.activeTool)) {
-      dispatch({ type: "APPLY_TOOL_POINT", point });
+      dispatch({ type: "APPLY_TOOL_POINT", point, brushSizeOverride: pressureAdjustedBrushSize(event) });
     }
   };
 
-  const onMouseMove = (event: React.MouseEvent<HTMLCanvasElement>): void => {
+  const onPointerMove = (event: React.PointerEvent<HTMLCanvasElement>): void => {
+    if (activePointerIdRef.current !== null && event.pointerId !== activePointerIdRef.current) return;
     if (event.buttons !== 0) event.preventDefault();
     if (panning) {
       dispatch({ type: "PAN", dx: event.movementX, dy: event.movementY });
@@ -639,6 +882,19 @@ export function CanvasStage({ state, dispatch }: Props): JSX.Element {
     }
     const point = getPixelPoint(event);
     if (!point) return;
+
+    if (state.editorMode === "bones") {
+      if (state.segmentSelectionMode && segmentSelectStart) {
+        setSegmentSelectCurrent(point);
+        dispatch({ type: "SET_SEGMENT_SELECTION", selection: normalizeRectSelection(segmentSelectStart, point) });
+        return;
+      }
+      if (rigDrag) {
+        dispatch({ type: "RIG_MOVE_JOINT", jointId: rigDrag.jointId, x: point.x, y: point.y, pushHistory: false });
+        setRigDrag({ ...rigDrag, moved: true });
+      }
+      return;
+    }
 
     if (state.activeTool === "grab") {
       if (!grabStart || !grabBasePixels) return;
@@ -686,14 +942,51 @@ export function CanvasStage({ state, dispatch }: Props): JSX.Element {
     if (!dragStart) return;
     setDragCurrent(point);
     if ((state.activeTool === "pencil" || state.activeTool === "eraser") && lastPoint) {
-        dispatch({ type: "APPLY_TOOL_DRAG", start: lastPoint, end: point, pushHistory: false });
+        console.log(event.pointerType, event.pressure);
+        dispatch({
+          type: "APPLY_TOOL_DRAG",
+          start: lastPoint,
+          end: point,
+          brushSizeOverride: pressureAdjustedBrushSize(event),
+          pushHistory: false
+        });
         setLastPoint(point);
       }
   };
 
-  const onMouseUp = (): void => {
+  const onPointerUp = (pointerId?: number): void => {
+    const resolvedPointerId = pointerId ?? activePointerIdRef.current;
+    const canvas = canvasRef.current;
+    if (canvas && resolvedPointerId !== null) {
+      try {
+        if (canvas.hasPointerCapture(resolvedPointerId)) canvas.releasePointerCapture(resolvedPointerId);
+      } catch {
+        // Ignore stale pointer capture release errors.
+      }
+    }
+    activePointerIdRef.current = null;
     if (panning) {
       setPanning(false);
+      return;
+    }
+
+    if (state.editorMode === "bones") {
+      if (state.segmentSelectionMode && segmentSelectStart && segmentSelectCurrent) {
+        dispatch({ type: "SET_SEGMENT_SELECTION", selection: normalizeRectSelection(segmentSelectStart, segmentSelectCurrent) });
+        dispatch({ type: "SET_SEGMENT_SELECTION_MODE", value: false });
+        setSegmentSelectStart(null);
+        setSegmentSelectCurrent(null);
+        return;
+      }
+      if (rigDrag?.moved) {
+        const joint = state.project.rig.joints.find((candidate) => candidate.id === rigDrag.jointId);
+        if (joint) {
+          dispatch({ type: "RIG_MOVE_JOINT", jointId: rigDrag.jointId, x: joint.x, y: joint.y });
+        }
+      }
+      setRigDrag(null);
+      setSegmentSelectStart(null);
+      setSegmentSelectCurrent(null);
       return;
     }
 
@@ -701,19 +994,25 @@ export function CanvasStage({ state, dispatch }: Props): JSX.Element {
       if (floatingSelection) {
         const activeFrame = state.project.frames[state.activeFrameIndex];
         const editablePixels = getEditablePixels(activeFrame);
-        const pasted = stampSelection(
-          editablePixels,
-          state.project.gridWidth,
-          state.project.gridHeight,
-          floatingSelection,
-          floatingSelection.pixels,
-          "overwrite"
-        );
+        const pasted = commitSelectionToLayerPixels({
+          basePixels: editablePixels,
+          gridWidth: state.project.gridWidth,
+          gridHeight: state.project.gridHeight,
+          srcX: floatingSelection.sourceX,
+          srcY: floatingSelection.sourceY,
+          width: floatingSelection.width,
+          height: floatingSelection.height,
+          dstX: floatingSelection.x,
+          dstY: floatingSelection.y,
+          selectedPixels: floatingSelection.pixels,
+          mask: floatingSelection.mask,
+          op: "move"
+        });
         dispatch({
           type: "UPDATE_FRAME_PIXELS",
           frameIndex: state.activeFrameIndex,
           pixels: pasted,
-          pushHistory: false
+          pushHistory: true
         });
         setSelectionBox(floatingSelection);
         setFloatingSelection(null);
@@ -788,13 +1087,20 @@ export function CanvasStage({ state, dispatch }: Props): JSX.Element {
       x: offsetX,
       y: offsetY
     };
-    const pasted = stampSelection(
-      editablePixels,
-      state.project.gridWidth,
-      state.project.gridHeight,
-      target,
-      clipboardSelection.pixels
-    );
+    const pasted = commitSelectionToLayerPixels({
+      basePixels: editablePixels,
+      gridWidth: state.project.gridWidth,
+      gridHeight: state.project.gridHeight,
+      srcX: clipboardSelection.x,
+      srcY: clipboardSelection.y,
+      width: target.width,
+      height: target.height,
+      dstX: target.x,
+      dstY: target.y,
+      selectedPixels: clipboardSelection.pixels,
+      mask: target.mask,
+      op: "paste"
+    });
     dispatch({
       type: "UPDATE_FRAME_PIXELS",
       frameIndex: state.activeFrameIndex,
@@ -815,7 +1121,20 @@ export function CanvasStage({ state, dispatch }: Props): JSX.Element {
       x: selectionBox.x + 1,
       y: selectionBox.y + 1
     };
-    const pasted = stampSelection(editablePixels, state.project.gridWidth, state.project.gridHeight, target, pixels);
+    const pasted = commitSelectionToLayerPixels({
+      basePixels: editablePixels,
+      gridWidth: state.project.gridWidth,
+      gridHeight: state.project.gridHeight,
+      srcX: selectionBox.x,
+      srcY: selectionBox.y,
+      width: target.width,
+      height: target.height,
+      dstX: target.x,
+      dstY: target.y,
+      selectedPixels: pixels,
+      mask: target.mask,
+      op: "duplicate"
+    });
     dispatch({
       type: "UPDATE_FRAME_PIXELS",
       frameIndex: state.activeFrameIndex,
@@ -853,13 +1172,20 @@ export function CanvasStage({ state, dispatch }: Props): JSX.Element {
     );
     const rotated = rotateSelectionData({ ...selectionBox, mask: selectedMask }, selected, degrees);
     if (sameSelectionImage(selectionBox, selected, rotated.selection, rotated.pixels)) return;
-    const pasted = stampSelection(
-      remaining,
-      state.project.gridWidth,
-      state.project.gridHeight,
-      rotated.selection,
-      rotated.pixels
-    );
+    const pasted = commitSelectionToLayerPixels({
+      basePixels: remaining,
+      gridWidth: state.project.gridWidth,
+      gridHeight: state.project.gridHeight,
+      srcX: rotated.selection.x,
+      srcY: rotated.selection.y,
+      width: rotated.selection.width,
+      height: rotated.selection.height,
+      dstX: rotated.selection.x,
+      dstY: rotated.selection.y,
+      selectedPixels: rotated.pixels,
+      mask: rotated.selection.mask,
+      op: "paste"
+    });
     dispatch({
       type: "UPDATE_FRAME_PIXELS",
       frameIndex: state.activeFrameIndex,
@@ -933,48 +1259,71 @@ export function CanvasStage({ state, dispatch }: Props): JSX.Element {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [floatingSelection, selectionBox, state.activeFrameIndex, state.project.gridHeight, state.project.gridWidth]);
 
+  useEffect(() => {
+    const handleWindowPointerUp = (event: PointerEvent): void => {
+      if (activePointerIdRef.current !== null && event.pointerId !== activePointerIdRef.current) return;
+      onPointerUp(event.pointerId);
+    };
+    window.addEventListener("pointerup", handleWindowPointerUp);
+    window.addEventListener("pointercancel", handleWindowPointerUp);
+    return () => {
+      window.removeEventListener("pointerup", handleWindowPointerUp);
+      window.removeEventListener("pointercancel", handleWindowPointerUp);
+    };
+  });
+
   return (
     <>
-      <div className="canvas-actions">
-        <button onClick={copySelection} disabled={!floatingSelection && !selectionBox}>
-          Copy
-        </button>
-        <button onClick={pasteSelection} disabled={!clipboardSelection}>
-          Paste
-        </button>
-        <button onClick={duplicateSelection} disabled={!selectionBox}>
-          Duplicate
-        </button>
-        <button onClick={() => rotateSelectionByPixelStep(-1)} disabled={!floatingSelection && !selectionBox}>
-          Rotate -1px
-        </button>
-        <button onClick={() => rotateSelectionByPixelStep(1)} disabled={!floatingSelection && !selectionBox}>
-          Rotate +1px
-        </button>
-        <button onClick={removeSelectedArea} disabled={!floatingSelection && !selectionBox}>
-          Remove Selected
-        </button>
-        <button onClick={() => flipImage("horizontal")}>
-          Flip H
-        </button>
-        <button onClick={() => flipImage("vertical")}>
-          Flip V
-        </button>
-        <button onClick={() => dispatch({ type: "UNDO" })} disabled={state.undoStack.length === 0}>
-          Undo
-        </button>
-        <button onClick={() => dispatch({ type: "REDO" })} disabled={state.redoStack.length === 0}>
-          Redo
-        </button>
+      <div className="toolbar">
+        <div className="toolbarGroup">{canvasGroup}</div>
+        <div className="toolbarDivider" />
+        <div className="toolbarGroup">
+          <button className="toolbarBtn" onClick={copySelection} disabled={!floatingSelection && !selectionBox}>
+            Copy
+          </button>
+          <button className="toolbarBtn" onClick={pasteSelection} disabled={!clipboardSelection}>
+            Paste
+          </button>
+          <button className="toolbarBtn" onClick={duplicateSelection} disabled={!selectionBox}>
+            Duplicate
+          </button>
+          <button className="toolbarBtn" onClick={removeSelectedArea} disabled={!floatingSelection && !selectionBox}>
+            Remove Selected
+          </button>
+        </div>
+        <div className="toolbarDivider" />
+        <div className="toolbarGroup">
+          <button className="toolbarBtn" onClick={() => rotateSelectionByPixelStep(-1)} disabled={!floatingSelection && !selectionBox}>
+            Rotate -1px
+          </button>
+          <button className="toolbarBtn" onClick={() => rotateSelectionByPixelStep(1)} disabled={!floatingSelection && !selectionBox}>
+            Rotate +1px
+          </button>
+          <button className="toolbarBtn" onClick={() => flipImage("horizontal")}>
+            Flip H
+          </button>
+          <button className="toolbarBtn" onClick={() => flipImage("vertical")}>
+            Flip V
+          </button>
+        </div>
+        <div className="toolbarDivider" />
+        <div className="toolbarGroup historyGroup">
+          <button className="toolbarBtn" onClick={() => dispatch({ type: "UNDO" })} disabled={state.undoStack.length === 0}>
+            Undo
+          </button>
+          <button className="toolbarBtn" onClick={() => dispatch({ type: "REDO" })} disabled={state.redoStack.length === 0}>
+            Redo
+          </button>
+        </div>
       </div>
       <div className="canvas-wrap" ref={wrapRef}>
         <canvas
           ref={canvasRef}
           onContextMenu={(e) => e.preventDefault()}
-          onMouseDown={onMouseDown}
-          onMouseMove={onMouseMove}
-          onMouseUp={onMouseUp}
-          onMouseLeave={onMouseUp}
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={(event) => onPointerUp(event.pointerId)}
+          onPointerLeave={(event) => onPointerUp(event.pointerId)}
         />
       </div>
     </>
