@@ -7,7 +7,7 @@ import { getCompositePixels } from "../editor/layers";
 
 function frameToCanvas(
   frame: Frame,
-  frameIndex: number,
+  framePoseKey: string,
   width: number,
   height: number,
   scale: number,
@@ -39,7 +39,7 @@ function frameToCanvas(
     }
   }
   if (rigOptions?.includeOverlay) {
-    drawRigOverlay(ctx, rigOptions.rig, frameIndex, rigOptions.rigPoseByFrame, scale, 0, 0, null, null);
+    drawRigOverlay(ctx, rigOptions.rig, framePoseKey, rigOptions.rigPoseByFrame, scale, 0, 0, null, null);
   }
   return canvas;
 }
@@ -51,9 +51,9 @@ export function exportFrameImage(
   scale: number,
   format: "png" | "jpeg",
   rigOptions?: { rig: RigData; rigPoseByFrame: Record<string, Record<string, BonePose>>; includeOverlay: boolean },
-  frameIndex = 0
+  framePoseKey = frame.id
 ): string {
-  const canvas = frameToCanvas(frame, frameIndex, width, height, scale, undefined, rigOptions);
+  const canvas = frameToCanvas(frame, framePoseKey, width, height, scale, undefined, rigOptions);
   return canvas.toDataURL(format === "png" ? "image/png" : "image/jpeg", 0.95);
 }
 
@@ -100,7 +100,7 @@ export async function exportGif(
 
   for (let frameIndex = 0; frameIndex < frames.length; frameIndex += 1) {
     const frame = frames[frameIndex];
-    const canvas = frameToCanvas(frame, frameIndex, width, height, scale, transparentKey, rigOptions);
+    const canvas = frameToCanvas(frame, frame.id ?? String(frameIndex), width, height, scale, transparentKey, rigOptions);
     const delay = fpsOverrideEnabled ? Math.round(1000 / fps) : frame.durationMs;
     gif.addFrame(canvas, { delay, copy: true });
   }

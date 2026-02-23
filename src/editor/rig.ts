@@ -75,15 +75,28 @@ export function normalizeRigData(project: LegacyProjectRigShape): RigData {
 }
 
 export function normalizeRigPoseByFrame(project: LegacyProjectRigShape, rig: RigData): Record<string, Record<string, BonePose>> {
-  const frameCount = (project.frames ?? []).length;
-  const validFrameKeys = new Set(Array.from({ length: frameCount }, (_, index) => String(index)));
+  const frames = project.frames ?? [];
+  const frameIdByIndex = new Map<number, string>();
+  const validFrameIds = new Set<string>();
+  frames.forEach((frame, index) => {
+    const id = typeof frame.id === "string" && frame.id.length > 0 ? frame.id : String(index);
+    frameIdByIndex.set(index, id);
+    validFrameIds.add(id);
+  });
   const validBoneIds = new Set(rig.bones.map((bone) => bone.id));
   const output: Record<string, Record<string, BonePose>> = {};
 
   const directInput = project.rigPoseByFrame;
   if (directInput && typeof directInput === "object") {
     for (const [frameKey, framePose] of Object.entries(directInput)) {
-      if (!validFrameKeys.has(frameKey) || !framePose || typeof framePose !== "object") continue;
+      if (!framePose || typeof framePose !== "object") continue;
+      let normalizedFrameId: string | undefined;
+      if (validFrameIds.has(frameKey)) normalizedFrameId = frameKey;
+      else {
+        const asIndex = Number(frameKey);
+        if (Number.isFinite(asIndex)) normalizedFrameId = frameIdByIndex.get(asIndex);
+      }
+      if (!normalizedFrameId) continue;
       const normalizedPose: Record<string, BonePose> = {};
       for (const [boneId, pose] of Object.entries(framePose)) {
         if (!validBoneIds.has(boneId)) continue;
@@ -98,7 +111,7 @@ export function normalizeRigPoseByFrame(project: LegacyProjectRigShape, rig: Rig
           dy: sanitizeNumber((pose as { dy?: unknown }).dy, 0)
         };
       }
-      output[frameKey] = normalizedPose;
+      output[normalizedFrameId] = normalizedPose;
     }
     return output;
   }
@@ -106,14 +119,8 @@ export function normalizeRigPoseByFrame(project: LegacyProjectRigShape, rig: Rig
   // Backward compatibility with legacy rig.poseByFrame keyed by frame id.
   const legacyPose = (project.rig as { poseByFrame?: Record<string, Record<string, { rotDeg?: unknown }>> } | undefined)?.poseByFrame;
   if (legacyPose && typeof legacyPose === "object") {
-    const frameIdToIndex = new Map<string, number>();
-    (project.frames ?? []).forEach((frame, index) => {
-      if (typeof frame.id === "string") frameIdToIndex.set(frame.id, index);
-    });
     for (const [frameId, framePose] of Object.entries(legacyPose)) {
-      const frameIndex = frameIdToIndex.get(frameId);
-      if (typeof frameIndex !== "number" || !framePose || typeof framePose !== "object") continue;
-      const key = String(frameIndex);
+      if (!validFrameIds.has(frameId) || !framePose || typeof framePose !== "object") continue;
       const normalizedPose: Record<string, BonePose> = {};
       for (const [boneId, pose] of Object.entries(framePose)) {
         if (!validBoneIds.has(boneId)) continue;
@@ -124,7 +131,7 @@ export function normalizeRigPoseByFrame(project: LegacyProjectRigShape, rig: Rig
           dy: sanitizeNumber((pose as { dy?: unknown }).dy, 0)
         };
       }
-      output[key] = normalizedPose;
+      output[frameId] = normalizedPose;
     }
   }
   return output;
@@ -139,12 +146,12 @@ function rotateVector(x: number, y: number, angleRad: number): { x: number; y: n
   };
 }
 
-function poseByBone(frameIndex: number, rigPoseByFrame: Record<string, Record<string, BonePose>>, boneId: string): BonePose {
-  const pose = rigPoseByFrame[String(frameIndex)]?.[boneId];
+function poseByBone(frameId: string, rigPoseByFrame: Record<string, Record<string, BonePose>>, boneId: string): BonePose {
+  const pose = rigPoseByFrame[frameId]?.[boneId];
   return pose ?? { rotDeg: 0 };
 }
 
-export function buildPosedRig(frameIndex: number, rig: RigData, rigPoseByFrame: Record<string, Record<string, BonePose>>): PosedRig {
+export function buildPosedRig(frameId: string, rig: RigData, rigPoseByFrame: Record<string, Record<string, BonePose>>): PosedRig {
   const baseJointMap: Record<string, { x: number; y: number }> = {};
   for (const joint of rig.joints) {
     baseJointMap[joint.id] = { x: joint.x, y: joint.y };
@@ -171,7 +178,7 @@ export function buildPosedRig(frameIndex: number, rig: RigData, rigPoseByFrame: 
     const baseB = baseJointMap[bone.bJointId];
     if (!baseA || !baseB) return;
     const baseStart = jointMap[bone.aJointId] ?? baseA;
-    const pose = poseByBone(frameIndex, rigPoseByFrame, bone.id);
+    const pose = poseByBone(frameId, rigPoseByFrame, bone.id);
     const start = { x: baseStart.x + (pose.dx ?? 0), y: baseStart.y + (pose.dy ?? 0) };
     const restVector = { x: baseB.x - baseA.x, y: baseB.y - baseA.y };
     const deltaRad = inheritedDeltaRad + (pose.rotDeg * Math.PI) / 180;
@@ -198,7 +205,7 @@ function drawCircle(ctx: CanvasRenderingContext2D, x: number, y: number, radius:
 export function drawRigOverlay(
   ctx: CanvasRenderingContext2D,
   rig: RigData,
-  frameIndex: number,
+  frameId: string,
   rigPoseByFrame: Record<string, Record<string, BonePose>>,
   zoom: number,
   panX: number,
@@ -207,7 +214,7 @@ export function drawRigOverlay(
   selectedBoneId: string | null
 ): void {
   if (rig.joints.length === 0) return;
-  const posed = buildPosedRig(frameIndex, rig, rigPoseByFrame);
+  const posed = buildPosedRig(frameId, rig, rigPoseByFrame);
 
   for (const bone of rig.bones) {
     const a = posed.boneStartMap[bone.id] ?? posed.jointMap[bone.aJointId];

@@ -42,6 +42,42 @@ interface RigDragState {
   moved: boolean;
 }
 
+interface ScreenPoint {
+  x: number;
+  y: number;
+}
+
+interface TouchGestureState {
+  anchorWorld: ScreenPoint;
+  startDistance: number;
+  startZoom: number;
+}
+
+function screenToWorld(screen: ScreenPoint, camX: number, camY: number, zoom: number): ScreenPoint {
+  return {
+    x: (screen.x - camX) / zoom,
+    y: (screen.y - camY) / zoom
+  };
+}
+
+function worldToScreen(world: ScreenPoint, camX: number, camY: number, zoom: number): ScreenPoint {
+  return {
+    x: world.x * zoom + camX,
+    y: world.y * zoom + camY
+  };
+}
+
+function getTouchMidpoint(points: ScreenPoint[]): ScreenPoint {
+  return {
+    x: (points[0].x + points[1].x) / 2,
+    y: (points[0].y + points[1].y) / 2
+  };
+}
+
+function getTouchDistance(points: ScreenPoint[]): number {
+  return Math.hypot(points[1].x - points[0].x, points[1].y - points[0].y);
+}
+
 function normalizeRectSelection(start: Point, end: Point): { x: number; y: number; w: number; h: number } {
   const xMin = Math.min(start.x, end.x);
   const yMin = Math.min(start.y, end.y);
@@ -407,6 +443,9 @@ export function CanvasStage({ state, dispatch, canvasGroup }: Props): JSX.Elemen
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const activePointerIdRef = useRef<number | null>(null);
+  const touchPointersRef = useRef<Map<number, ScreenPoint>>(new Map());
+  const penPointersRef = useRef<Set<number>>(new Set());
+  const touchGestureRef = useRef<TouchGestureState | null>(null);
   const [dragStart, setDragStart] = useState<Point | null>(null);
   const [dragCurrent, setDragCurrent] = useState<Point | null>(null);
   const [lastPoint, setLastPoint] = useState<Point | null>(null);
@@ -425,6 +464,7 @@ export function CanvasStage({ state, dispatch, canvasGroup }: Props): JSX.Elemen
   const [grabHasPushedHistory, setGrabHasPushedHistory] = useState(false);
 
   const frame = state.project.frames[state.activeFrameIndex];
+  const activeFramePoseKey = frame?.id ?? String(state.activeFrameIndex);
   const prevFrame = state.project.frames[state.activeFrameIndex - 1] ?? null;
   const nextFrame = state.project.frames[state.activeFrameIndex + 1] ?? null;
   const framePixels = useMemo(
@@ -514,6 +554,65 @@ export function CanvasStage({ state, dispatch, canvasGroup }: Props): JSX.Elemen
     return { x: px, y: py };
   };
 
+  const getCanvasScreenPoint = (event: React.PointerEvent<HTMLCanvasElement> | PointerEvent): ScreenPoint | null => {
+    const canvas = canvasRef.current;
+    if (!canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: event.clientX - rect.left,
+      y: event.clientY - rect.top
+    };
+  };
+
+  const applyCamera = (nextZoom: number, nextPanX: number, nextPanY: number): void => {
+    const zoomChanged = Math.abs(nextZoom - state.zoom) > 0.0001;
+    const panDx = nextPanX - state.panX;
+    const panDy = nextPanY - state.panY;
+    if (zoomChanged) {
+      dispatch({ type: "SET_ZOOM", zoom: nextZoom });
+    }
+    if (Math.abs(panDx) > 0.0001 || Math.abs(panDy) > 0.0001) {
+      dispatch({ type: "PAN", dx: panDx, dy: panDy });
+    }
+  };
+
+  const resetView = (): void => {
+    applyCamera(20, 40, 40);
+  };
+
+  const cancelActiveInteraction = (): void => {
+    setPanning(false);
+    setDragStart(null);
+    setDragCurrent(null);
+    setLastPoint(null);
+    setGrabStart(null);
+    setGrabBasePixels(null);
+    setGrabHasPushedHistory(false);
+    setLassoPath(null);
+    setRigDrag(null);
+    setSegmentSelectStart(null);
+    setSegmentSelectCurrent(null);
+  };
+
+  const maybeStartTouchGesture = (): void => {
+    if (penPointersRef.current.size > 0) return;
+    const touchPoints = Array.from(touchPointersRef.current.values());
+    if (touchPoints.length !== 2) {
+      touchGestureRef.current = null;
+      return;
+    }
+    const midpoint = getTouchMidpoint(touchPoints);
+    const distance = getTouchDistance(touchPoints);
+    if (distance < 8) return;
+    touchGestureRef.current = {
+      startDistance: distance,
+      startZoom: state.zoom,
+      anchorWorld: screenToWorld(midpoint, state.panX, state.panY, state.zoom)
+    };
+    cancelActiveInteraction();
+    activePointerIdRef.current = null;
+  };
+
   const pressureAdjustedBrushSize = (event: React.PointerEvent<HTMLCanvasElement>): number => {
     const pressure = event.pointerType === "pen" ? event.pressure || 1 : 1;
     const scaled = state.brushSize * (0.5 + pressure * 0.5);
@@ -522,7 +621,7 @@ export function CanvasStage({ state, dispatch, canvasGroup }: Props): JSX.Elemen
 
   const rigJointAtPoint = (point: Point): string | null => {
     if (!frame) return null;
-    const posed = buildPosedRig(state.activeFrameIndex, state.project.rig, state.project.rigPoseByFrame);
+    const posed = buildPosedRig(activeFramePoseKey, state.project.rig, state.project.rigPoseByFrame);
     for (const joint of state.project.rig.joints) {
       const posedJoint = posed.jointMap[joint.id];
       if (!posedJoint) continue;
@@ -533,7 +632,7 @@ export function CanvasStage({ state, dispatch, canvasGroup }: Props): JSX.Elemen
 
   const rigBoneAtPoint = (point: Point): string | null => {
     if (!frame) return null;
-    const posed = buildPosedRig(state.activeFrameIndex, state.project.rig, state.project.rigPoseByFrame);
+    const posed = buildPosedRig(activeFramePoseKey, state.project.rig, state.project.rigPoseByFrame);
     let bestId: string | null = null;
     let bestDistance = Number.POSITIVE_INFINITY;
     for (const bone of state.project.rig.bones) {
@@ -603,7 +702,7 @@ export function CanvasStage({ state, dispatch, canvasGroup }: Props): JSX.Elemen
       .slice()
       .sort((a, b) => a.zIndex - b.zIndex);
     if (segmentsForFrame.length > 0) {
-      const posedRig = buildPosedRig(state.activeFrameIndex, state.project.rig, state.project.rigPoseByFrame);
+      const posedRig = buildPosedRig(activeFramePoseKey, state.project.rig, state.project.rigPoseByFrame);
       for (const segment of segmentsForFrame) {
         const image = segmentImageMap[segment.id];
         if (!image) continue;
@@ -721,7 +820,7 @@ export function CanvasStage({ state, dispatch, canvasGroup }: Props): JSX.Elemen
       drawRigOverlay(
         ctx,
         state.project.rig,
-        state.activeFrameIndex,
+        activeFramePoseKey,
         state.project.rigPoseByFrame,
         state.zoom,
         state.panX,
@@ -762,14 +861,45 @@ export function CanvasStage({ state, dispatch, canvasGroup }: Props): JSX.Elemen
   }, [dispatch, state.panX, state.panY, state.zoom]);
 
   const onPointerDown = (event: React.PointerEvent<HTMLCanvasElement>): void => {
-    event.preventDefault();
     const canvas = canvasRef.current;
     if (!canvas) return;
-    if (activePointerIdRef.current !== null && activePointerIdRef.current !== event.pointerId) return;
+    const isTouch = event.pointerType === "touch";
+    const isPen = event.pointerType === "pen";
+
+    if (isTouch || isPen) {
+      event.preventDefault();
+    }
+
+    if (isPen) {
+      penPointersRef.current.add(event.pointerId);
+      touchGestureRef.current = null;
+    }
+
+    if (isTouch) {
+      const touchPoint = getCanvasScreenPoint(event);
+      if (touchPoint) {
+        touchPointersRef.current.set(event.pointerId, touchPoint);
+      }
+      if (touchPointersRef.current.size >= 2) {
+        maybeStartTouchGesture();
+        try {
+          canvas.setPointerCapture(event.pointerId);
+        } catch {
+          // Ignore pointer capture errors on stale pointers.
+        }
+        return;
+      }
+      if (penPointersRef.current.size > 0) return;
+    }
+
+    if (!isTouch && activePointerIdRef.current !== null && activePointerIdRef.current !== event.pointerId) return;
     activePointerIdRef.current = event.pointerId;
-    canvas.setPointerCapture(event.pointerId);
+    try {
+      canvas.setPointerCapture(event.pointerId);
+    } catch {
+      // Ignore pointer capture errors on older iOS Safari implementations.
+    }
     canvas.style.touchAction = "none";
-    console.log(event.pointerType, event.pressure);
     if (event.button === 2) {
       setPanning(true);
       return;
@@ -874,6 +1004,44 @@ export function CanvasStage({ state, dispatch, canvasGroup }: Props): JSX.Elemen
   };
 
   const onPointerMove = (event: React.PointerEvent<HTMLCanvasElement>): void => {
+    const isTouch = event.pointerType === "touch";
+    const isPen = event.pointerType === "pen";
+
+    if (isTouch) {
+      event.preventDefault();
+      const touchPoint = getCanvasScreenPoint(event);
+      if (touchPoint) {
+        touchPointersRef.current.set(event.pointerId, touchPoint);
+      }
+      if (penPointersRef.current.size === 0 && touchPointersRef.current.size === 2) {
+        if (!touchGestureRef.current) {
+          maybeStartTouchGesture();
+        }
+        const gesture = touchGestureRef.current;
+        if (gesture) {
+          const touchPoints = Array.from(touchPointersRef.current.values());
+          const currentMid = getTouchMidpoint(touchPoints);
+          const currentDist = getTouchDistance(touchPoints);
+          const zoomFactor = gesture.startDistance <= 0 ? 1 : currentDist / gesture.startDistance;
+          const nextZoom = Math.min(80, Math.max(4, gesture.startZoom * zoomFactor));
+          const anchoredScreen = worldToScreen(gesture.anchorWorld, 0, 0, nextZoom);
+          const nextPanX = currentMid.x - anchoredScreen.x;
+          const nextPanY = currentMid.y - anchoredScreen.y;
+          applyCamera(nextZoom, nextPanX, nextPanY);
+        }
+        return;
+      }
+      if (touchGestureRef.current && touchPointersRef.current.size < 2) {
+        touchGestureRef.current = null;
+      }
+    }
+
+    if (isPen) {
+      event.preventDefault();
+      penPointersRef.current.add(event.pointerId);
+      touchGestureRef.current = null;
+    }
+
     if (activePointerIdRef.current !== null && event.pointerId !== activePointerIdRef.current) return;
     if (event.buttons !== 0) event.preventDefault();
     if (panning) {
@@ -942,7 +1110,6 @@ export function CanvasStage({ state, dispatch, canvasGroup }: Props): JSX.Elemen
     if (!dragStart) return;
     setDragCurrent(point);
     if ((state.activeTool === "pencil" || state.activeTool === "eraser") && lastPoint) {
-        console.log(event.pointerType, event.pressure);
         dispatch({
           type: "APPLY_TOOL_DRAG",
           start: lastPoint,
@@ -964,6 +1131,16 @@ export function CanvasStage({ state, dispatch, canvasGroup }: Props): JSX.Elemen
         // Ignore stale pointer capture release errors.
       }
     }
+    if (resolvedPointerId !== null) {
+      touchPointersRef.current.delete(resolvedPointerId);
+      penPointersRef.current.delete(resolvedPointerId);
+    }
+    if (touchPointersRef.current.size < 2) {
+      touchGestureRef.current = null;
+    }
+    const wasActivePointer = resolvedPointerId !== null && activePointerIdRef.current === resolvedPointerId;
+    if (!wasActivePointer) return;
+
     activePointerIdRef.current = null;
     if (panning) {
       setPanning(false);
@@ -1261,7 +1438,6 @@ export function CanvasStage({ state, dispatch, canvasGroup }: Props): JSX.Elemen
 
   useEffect(() => {
     const handleWindowPointerUp = (event: PointerEvent): void => {
-      if (activePointerIdRef.current !== null && event.pointerId !== activePointerIdRef.current) return;
       onPointerUp(event.pointerId);
     };
     window.addEventListener("pointerup", handleWindowPointerUp);
@@ -1307,6 +1483,13 @@ export function CanvasStage({ state, dispatch, canvasGroup }: Props): JSX.Elemen
           </button>
         </div>
         <div className="toolbarDivider" />
+        <div className="toolbarGroup">
+          <button className="toolbarBtn" onClick={resetView}>
+            Reset View
+          </button>
+          <span className="toolbarMeta">{Math.round(state.zoom * 5)}%</span>
+        </div>
+        <div className="toolbarDivider" />
         <div className="toolbarGroup historyGroup">
           <button className="toolbarBtn" onClick={() => dispatch({ type: "UNDO" })} disabled={state.undoStack.length === 0}>
             Undo
@@ -1316,13 +1499,14 @@ export function CanvasStage({ state, dispatch, canvasGroup }: Props): JSX.Elemen
           </button>
         </div>
       </div>
-      <div className="canvas-wrap" ref={wrapRef}>
+      <div className="canvas-wrap canvasWrap" ref={wrapRef}>
         <canvas
           ref={canvasRef}
           onContextMenu={(e) => e.preventDefault()}
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
           onPointerUp={(event) => onPointerUp(event.pointerId)}
+          onPointerCancel={(event) => onPointerUp(event.pointerId)}
           onPointerLeave={(event) => onPointerUp(event.pointerId)}
         />
       </div>

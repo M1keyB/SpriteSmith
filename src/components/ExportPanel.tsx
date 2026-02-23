@@ -34,7 +34,7 @@ export function ExportPanel({ state, dispatch }: Props): JSX.Element {
         rigPoseByFrame: state.project.rigPoseByFrame,
         includeOverlay: state.project.rig.includeOverlayInExport
       },
-      state.activeFrameIndex
+      activeFrame.id
     );
     const a = document.createElement("a");
     a.href = url;

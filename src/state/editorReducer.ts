@@ -156,6 +156,10 @@ function cloneFrameWithFreshLayerIds(frame: Frame): Frame {
   };
 }
 
+function framePoseKey(frame: Frame | undefined, fallbackIndex = 0): string {
+  return frame?.id ?? String(fallbackIndex);
+}
+
 function defaultProject(): ProjectData {
   return {
     name: "Untitled SpriteSmith",
@@ -447,22 +451,25 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
     case "ADD_FRAME": {
       const frame = createEmptyFrame(state.project.gridWidth, state.project.gridHeight);
       const frames = [...state.project.frames, frame];
-      return pushHistory({ ...state, activeFrameIndex: frames.length - 1 }, { ...state.project, frames });
+      const sourceFrame = state.project.frames[state.activeFrameIndex] ?? state.project.frames[0];
+      const sourceKey = framePoseKey(sourceFrame, state.activeFrameIndex);
+      const nextKey = framePoseKey(frame, frames.length - 1);
+      const rigPoseByFrame = {
+        ...state.project.rigPoseByFrame,
+        [nextKey]: { ...(state.project.rigPoseByFrame[sourceKey] ?? {}) }
+      };
+      return pushHistory({ ...state, activeFrameIndex: frames.length - 1 }, { ...state.project, frames, rigPoseByFrame });
     }
     case "DUPLICATE_FRAME": {
       const src = state.project.frames[action.frameIndex];
       const dup: Frame = cloneFrameWithFreshLayerIds(src);
       const frames = state.project.frames.slice();
       frames.splice(action.frameIndex + 1, 0, dup);
-      const rigPoseByFrame: ProjectData["rigPoseByFrame"] = {};
-      for (const [key, value] of Object.entries(state.project.rigPoseByFrame)) {
-        const index = Number(key);
-        if (!Number.isFinite(index)) continue;
-        if (index <= action.frameIndex) rigPoseByFrame[String(index)] = { ...value };
-        else rigPoseByFrame[String(index + 1)] = { ...value };
-      }
-      rigPoseByFrame[String(action.frameIndex + 1)] = {
-        ...(state.project.rigPoseByFrame[String(action.frameIndex)] ?? {})
+      const srcKey = framePoseKey(src, action.frameIndex);
+      const dupKey = framePoseKey(dup, action.frameIndex + 1);
+      const rigPoseByFrame: ProjectData["rigPoseByFrame"] = {
+        ...state.project.rigPoseByFrame,
+        [dupKey]: { ...(state.project.rigPoseByFrame[srcKey] ?? {}) }
       };
       const segments = state.project.segments.map((segment) => ({
         ...segment,
@@ -475,13 +482,11 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
     }
     case "DELETE_FRAME": {
       if (state.project.frames.length <= 1) return state;
+      const removedFrame = state.project.frames[action.frameIndex];
+      const removedKey = framePoseKey(removedFrame, action.frameIndex);
       const frames = state.project.frames.filter((_, i) => i !== action.frameIndex);
-      const rigPoseByFrame: ProjectData["rigPoseByFrame"] = {};
-      for (const [key, value] of Object.entries(state.project.rigPoseByFrame)) {
-        const index = Number(key);
-        if (!Number.isFinite(index) || index === action.frameIndex) continue;
-        rigPoseByFrame[String(index > action.frameIndex ? index - 1 : index)] = { ...value };
-      }
+      const rigPoseByFrame: ProjectData["rigPoseByFrame"] = { ...state.project.rigPoseByFrame };
+      delete rigPoseByFrame[removedKey];
       const activeFrameIndex = clamp(
         state.activeFrameIndex > action.frameIndex ? state.activeFrameIndex - 1 : state.activeFrameIndex,
         0,
@@ -506,18 +511,7 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
       else if (action.from < active && action.to >= active) active -= 1;
       else if (action.from > active && action.to <= active) active += 1;
 
-      const rigPoseByFrame: ProjectData["rigPoseByFrame"] = {};
-      for (let index = 0; index < frames.length; index += 1) {
-        const sourceIndex =
-          index === action.to
-            ? action.from
-            : action.from < action.to && index >= action.from && index < action.to
-              ? index + 1
-              : action.from > action.to && index > action.to && index <= action.from
-                ? index - 1
-                : index;
-        rigPoseByFrame[String(index)] = { ...(state.project.rigPoseByFrame[String(sourceIndex)] ?? {}) };
-      }
+      const rigPoseByFrame: ProjectData["rigPoseByFrame"] = { ...state.project.rigPoseByFrame };
 
       const remapFrameIndex = (index: number): number => {
         if (index === action.from) return action.to;
@@ -868,7 +862,7 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
 
       for (let i = 0; i < frameCount; i += 1) {
         const t = i / frameCount;
-        const key = String(i);
+        const key = framePoseKey(frames[i], i);
         const generatedPose = preset.fn(t, state.project.rig.bones, state.project.boneMapping, state.selectedRigBoneId);
         if (action.overwrite) rigPoseByFrame[key] = generatedPose;
         else rigPoseByFrame[key] = { ...(rigPoseByFrame[key] ?? {}), ...generatedPose };
@@ -972,7 +966,7 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
     }
     case "RIG_SET_BONE_ROTATION": {
       const frameIndex = clamp(action.frameIndex ?? state.activeFrameIndex, 0, state.project.frames.length - 1);
-      const key = String(frameIndex);
+      const key = framePoseKey(state.project.frames[frameIndex], frameIndex);
       const framePose = state.project.rigPoseByFrame[key] ?? {};
       const rigPoseByFrame = {
         ...state.project.rigPoseByFrame,

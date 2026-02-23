@@ -23,13 +23,43 @@ const TIMELINE_MAX_HEIGHT = 280;
 const TIMELINE_DEFAULT_HEIGHT = 170;
 const TIMELINE_HEIGHT_KEY = "timelineHeight";
 const TIMELINE_COLLAPSED_KEY = "timelineCollapsed";
+const TABLET_BREAKPOINT = 1024;
+
+type DrawerTab = "layers" | "rig" | "export";
+type FullscreenDocument = Document & {
+  webkitExitFullscreen?: () => Promise<void> | void;
+  msExitFullscreen?: () => Promise<void> | void;
+  webkitFullscreenElement?: Element | null;
+  msFullscreenElement?: Element | null;
+};
+type FullscreenElement = HTMLElement & {
+  webkitRequestFullscreen?: () => Promise<void> | void;
+  msRequestFullscreen?: () => Promise<void> | void;
+};
 
 function clampTimelineHeight(value: number): number {
   return Math.min(TIMELINE_MAX_HEIGHT, Math.max(TIMELINE_MIN_HEIGHT, value));
 }
 
+function getFullscreenElement(doc: FullscreenDocument): Element | null {
+  return doc.fullscreenElement ?? doc.webkitFullscreenElement ?? doc.msFullscreenElement ?? null;
+}
+
+function supportsFullscreen(doc: FullscreenDocument, element: FullscreenElement): boolean {
+  return Boolean(
+    element.requestFullscreen ||
+    element.webkitRequestFullscreen ||
+    element.msRequestFullscreen
+  );
+}
+
 function App(): JSX.Element {
   const [state, dispatch] = useReducer(editorReducer, initialEditorState);
+  const [isTabletLayout, setIsTabletLayout] = useState<boolean>(() => window.innerWidth <= TABLET_BREAKPOINT);
+  const [drawerTab, setDrawerTab] = useState<DrawerTab>("layers");
+  const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(() => window.innerWidth > TABLET_BREAKPOINT);
+  const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
+  const [canFullscreen, setCanFullscreen] = useState<boolean>(false);
   const [timelineHeight, setTimelineHeight] = useState<number>(() => {
     const saved = window.localStorage.getItem(TIMELINE_HEIGHT_KEY);
     const parsed = saved ? Number(saved) : Number.NaN;
@@ -43,6 +73,56 @@ function App(): JSX.Element {
   });
 
   useKeyboardShortcuts(dispatch, state);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    const setViewportHeightVar = (): void => {
+      root.style.setProperty("--vh", `${window.innerHeight * 0.01}px`);
+    };
+    setViewportHeightVar();
+    window.addEventListener("resize", setViewportHeightVar);
+    window.addEventListener("orientationchange", setViewportHeightVar);
+    window.visualViewport?.addEventListener("resize", setViewportHeightVar);
+    return () => {
+      window.removeEventListener("resize", setViewportHeightVar);
+      window.removeEventListener("orientationchange", setViewportHeightVar);
+      window.visualViewport?.removeEventListener("resize", setViewportHeightVar);
+    };
+  }, []);
+
+  useEffect(() => {
+    const media = window.matchMedia(`(max-width: ${TABLET_BREAKPOINT}px)`);
+    const syncLayoutMode = (matches: boolean): void => {
+      setIsTabletLayout(matches);
+      if (matches) {
+        setIsDrawerOpen(false);
+      } else {
+        setIsDrawerOpen(true);
+      }
+    };
+    syncLayoutMode(media.matches);
+    const onChange = (event: MediaQueryListEvent): void => syncLayoutMode(event.matches);
+    media.addEventListener("change", onChange);
+    return () => media.removeEventListener("change", onChange);
+  }, []);
+
+  useEffect(() => {
+    const doc = document as FullscreenDocument;
+    const root = document.documentElement as FullscreenElement;
+    setCanFullscreen(supportsFullscreen(doc, root));
+    const syncFullscreenState = (): void => {
+      setIsFullscreen(Boolean(getFullscreenElement(doc)));
+    };
+    syncFullscreenState();
+    document.addEventListener("fullscreenchange", syncFullscreenState);
+    document.addEventListener("webkitfullscreenchange", syncFullscreenState as EventListener);
+    document.addEventListener("msfullscreenchange", syncFullscreenState as EventListener);
+    return () => {
+      document.removeEventListener("fullscreenchange", syncFullscreenState);
+      document.removeEventListener("webkitfullscreenchange", syncFullscreenState as EventListener);
+      document.removeEventListener("msfullscreenchange", syncFullscreenState as EventListener);
+    };
+  }, []);
 
   useEffect(() => {
     autoSaveProject(state.project);
@@ -77,13 +157,49 @@ function App(): JSX.Element {
     window.addEventListener("pointerup", onPointerUp);
   };
 
+  const toggleFullscreen = async (): Promise<void> => {
+    const doc = document as FullscreenDocument;
+    const root = document.documentElement as FullscreenElement;
+    if (getFullscreenElement(doc)) {
+      if (doc.exitFullscreen) {
+        await doc.exitFullscreen();
+      } else if (doc.webkitExitFullscreen) {
+        await doc.webkitExitFullscreen();
+      } else if (doc.msExitFullscreen) {
+        await doc.msExitFullscreen();
+      }
+      return;
+    }
+    if (root.requestFullscreen) {
+      await root.requestFullscreen();
+    } else if (root.webkitRequestFullscreen) {
+      await root.webkitRequestFullscreen();
+    } else if (root.msRequestFullscreen) {
+      await root.msRequestFullscreen();
+    }
+  };
+
+  const rightPanelForMode = state.editorMode === "bones"
+    ? <RigPanel state={state} dispatch={dispatch} />
+    : <LayersPanel state={state} dispatch={dispatch} />;
+
   return (
     <div className="app-shell">
       <header className="topbar">
         <h1 className="brand"><span>SpriteSmith</span><AnvilIcon /></h1>
-        <div className="tabs">
+        <div className="tabs topbar-actions">
           <button className={state.tab === "editor" ? "active" : ""} onClick={() => dispatch({ type: "SET_TAB", tab: "editor" })}>Editor</button>
           <button className={state.tab === "sprite" ? "active" : ""} onClick={() => dispatch({ type: "SET_TAB", tab: "sprite" })}>Sprite Generator</button>
+          {canFullscreen ? (
+            <button onClick={() => { void toggleFullscreen(); }}>
+              {isFullscreen ? "Exit Full Screen" : "Full Screen"}
+            </button>
+          ) : null}
+          {isTabletLayout && state.tab === "editor" ? (
+            <button onClick={() => setIsDrawerOpen((open) => !open)}>
+              {isDrawerOpen ? "Hide Panels" : "Show Panels"}
+            </button>
+          ) : null}
         </div>
       </header>
 
@@ -97,8 +213,8 @@ function App(): JSX.Element {
           }}
         />
       ) : (
-        <main className="layout">
-          <aside className="left">
+        <main className={`layout ${isTabletLayout ? "layout-tablet" : ""}`}>
+          <aside className="left sidePanel">
             <ToolPanel
               editorMode={state.editorMode}
               onEditorModeChange={(mode) => dispatch({ type: "SET_EDITOR_MODE", mode })}
@@ -164,17 +280,44 @@ function App(): JSX.Element {
             />
           </section>
 
-          <aside className="right">
-            {state.editorMode === "bones" ? (
-              <RigPanel state={state} dispatch={dispatch} />
-            ) : (
-              <LayersPanel state={state} dispatch={dispatch} />
-            )}
-            <PreviewPanel state={state} dispatch={dispatch} />
-            <ExportPanel state={state} dispatch={dispatch} />
-          </aside>
+          {!isTabletLayout ? (
+            <aside className="right sidePanel">
+              {rightPanelForMode}
+              <PreviewPanel state={state} dispatch={dispatch} />
+              <ExportPanel state={state} dispatch={dispatch} />
+            </aside>
+          ) : null}
         </main>
       )}
+      {isTabletLayout && state.tab === "editor" ? (
+        <section className={`tablet-drawer ${isDrawerOpen ? "open" : "closed"}`}>
+          <div className="tablet-drawer-tabs">
+            <button className={drawerTab === "layers" ? "active" : ""} onClick={() => setDrawerTab("layers")}>Layers</button>
+            <button className={drawerTab === "rig" ? "active" : ""} onClick={() => setDrawerTab("rig")}>Rig</button>
+            <button className={drawerTab === "export" ? "active" : ""} onClick={() => setDrawerTab("export")}>Export</button>
+          </div>
+          <div className="tablet-drawer-body sidePanel">
+            {drawerTab === "layers" ? (
+              <>
+                <LayersPanel state={state} dispatch={dispatch} />
+                <PreviewPanel state={state} dispatch={dispatch} />
+              </>
+            ) : null}
+            {drawerTab === "rig" ? (
+              <>
+                <RigPanel state={state} dispatch={dispatch} />
+                <PreviewPanel state={state} dispatch={dispatch} />
+              </>
+            ) : null}
+            {drawerTab === "export" ? (
+              <>
+                <ExportPanel state={state} dispatch={dispatch} />
+                <PreviewPanel state={state} dispatch={dispatch} />
+              </>
+            ) : null}
+          </div>
+        </section>
+      ) : null}
     </div>
   );
 }

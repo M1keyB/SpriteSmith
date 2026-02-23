@@ -34,8 +34,10 @@ export function RigPanel({ state, dispatch }: Props): JSX.Element {
     .filter((segment) => segment.frameIndex === state.activeFrameIndex)
     .slice()
     .sort((a, b) => a.zIndex - b.zIndex);
+  const activeFrame = state.project.frames[state.activeFrameIndex];
+  const activeFramePoseKey = activeFrame?.id ?? String(state.activeFrameIndex);
   const selectedBoneRotation =
-    selectedBone ? state.project.rigPoseByFrame[String(state.activeFrameIndex)]?.[selectedBone.id]?.rotDeg ?? 0 : 0;
+    selectedBone ? state.project.rigPoseByFrame[activeFramePoseKey]?.[selectedBone.id]?.rotDeg ?? 0 : 0;
   const selection = state.segmentSelection;
   const mappingAssignedCount = PRESET_ROLES.filter((role) => Boolean(state.project.boneMapping[role])).length;
   const segmentsAttachedLabel = `${frameSegments.length} attached`;
@@ -96,7 +98,7 @@ export function RigPanel({ state, dispatch }: Props): JSX.Element {
     ctx.putImageData(new ImageData(rgba, w, h), 0, 0);
     const pixels = canvas.toDataURL("image/png");
     const anchor = { x: Math.floor(w / 2), y: Math.floor(h / 2) };
-    const posed = buildPosedRig(state.activeFrameIndex, state.project.rig, state.project.rigPoseByFrame);
+    const posed = buildPosedRig(activeFramePoseKey, state.project.rig, state.project.rigPoseByFrame);
     const startJoint = posed.boneStartMap[selectedBone.id] ?? posed.jointMap[selectedBone.aJointId];
     if (!startJoint) return;
     const originalAnchorWorld = { x: selection.x + anchor.x, y: selection.y + anchor.y };
